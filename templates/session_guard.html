@@ -1,0 +1,39 @@
+<script>
+    (function() {
+        // --- LOGIKA PENGAMAN TAB ---
+        
+        // 1. Cek apakah ini adalah login baru (dari redirect backend)
+        const urlParams = new URLSearchParams(window.location.search);
+        const isInitSession = urlParams.get('init_session') === '1';
+
+        // 2. Cek apakah Tab ini punya "Surat Izin" (Token)
+        // sessionStorage SANGAT PENTING: Data ini hilang otomatis saat Tab ditutup.
+        const tabToken = sessionStorage.getItem('ais_tab_token');
+
+        if (isInitSession) {
+            // SKENARIO A: User baru saja Login sukses
+            // Berikan "Surat Izin" ke Tab ini
+            sessionStorage.setItem('ais_tab_token', 'valid_session');
+            
+            // Hapus parameter ?init_session=1 dari URL agar rapi dan tidak bisa dicopy
+            const cleanUrl = window.location.pathname;
+            window.history.replaceState({}, document.title, cleanUrl);
+            
+        } else if (!tabToken) {
+            // SKENARIO B: User membuka Tab baru / Copy-Paste Link / Browser Restore
+            // Karena ini Tab baru, sessionStorage pasti KOSONG (tidak ada Token).
+            
+            console.warn("Akses ilegal terdeteksi: Tidak ada token sesi tab.");
+            
+            // HENTIKAN TAMPILAN HALAMAN
+            // Sembunyikan body agar hacker tidak sempat melihat data sekilas
+            document.documentElement.style.display = 'none'; 
+            
+            // TENDANG KELUAR
+            window.location.href = '/logout';
+        }
+        
+        // SKENARIO C: User melakukan Refresh (F5) di Tab yang sama
+        // Token masih ada di sessionStorage, jadi aman (tidak logout).
+    })();
+</script>

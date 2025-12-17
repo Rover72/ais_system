@@ -1,0 +1,186 @@
+<style>
+    /* Tombol Bulat Mengambang */
+    .chat-btn {
+        position: fixed;
+        bottom: 30px;
+        right: 30px;
+        width: 60px;
+        height: 60px;
+        background-color: #2563eb;
+        color: white;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.2);
+        z-index: 1000;
+        font-size: 30px;
+        transition: transform 0.3s;
+    }
+    .chat-btn:hover { transform: scale(1.1); background-color: #1d4ed8; }
+
+    /* Kotak Chat (Awalnya Sembunyi) */
+    .chat-box {
+        display: none;
+        position: fixed;
+        bottom: 100px;
+        right: 30px;
+        width: 320px;
+        height: 400px;
+        background: white;
+        border-radius: 12px;
+        box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        flex-direction: column;
+        z-index: 1000;
+        overflow: hidden;
+        border: 1px solid #e2e8f0;
+    }
+
+    /* Header Chat */
+    .chat-header {
+        background: #1e293b;
+        color: white;
+        padding: 15px;
+        font-weight: bold;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+    .chat-close { cursor: pointer; font-size: 18px; }
+
+    /* Area Pesan */
+    .chat-messages {
+        flex: 1;
+        padding: 15px;
+        overflow-y: auto;
+        background: #f8fafc;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    /* Bubble Chat */
+    .msg { max-width: 80%; padding: 8px 12px; border-radius: 10px; font-size: 13px; line-height: 1.4; }
+    .msg-bot { background: #e0f2fe; color: #0369a1; align-self: flex-start; border-bottom-left-radius: 0; }
+    .msg-user { background: #2563eb; color: white; align-self: flex-end; border-bottom-right-radius: 0; }
+    
+    /* Tombol Link dalam Chat */
+    .chat-link {
+        display: inline-block;
+        margin-top: 5px;
+        padding: 4px 8px;
+        background: #0284c7;
+        color: white;
+        text-decoration: none;
+        border-radius: 4px;
+        font-size: 11px;
+    }
+
+    /* Input Area */
+    .chat-input-area {
+        padding: 10px;
+        border-top: 1px solid #eee;
+        display: flex;
+        background: white;
+    }
+    .chat-input {
+        flex: 1;
+        padding: 8px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        outline: none;
+    }
+    .chat-send {
+        margin-left: 8px;
+        background: #2563eb;
+        color: white;
+        border: none;
+        padding: 0 15px;
+        border-radius: 4px;
+        cursor: pointer;
+    }
+</style>
+
+<div class="chat-btn" onclick="toggleChat()">💬</div>
+
+<div class="chat-box" id="chatBox">
+    <div class="chat-header">
+        <span>🤖 AIS Assistant</span>
+        <span class="chat-close" onclick="toggleChat()">✖</span>
+    </div>
+    <div class="chat-messages" id="chatMessages">
+        <div class="msg msg-bot">Halo! Saya asisten AIS. Ketik 'Premi', 'Klaim', atau 'Bantuan' untuk memulai.</div>
+    </div>
+    <div class="chat-input-area">
+        <input type="text" id="chatInput" class="chat-input" placeholder="Tanya sesuatu..." onkeypress="handleEnter(event)">
+        <button class="chat-send" onclick="sendMessage()">➤</button>
+    </div>
+</div>
+
+<script>
+    function toggleChat() {
+        const box = document.getElementById('chatBox');
+        box.style.display = box.style.display === 'flex' ? 'none' : 'flex';
+        if(box.style.display === 'flex') document.getElementById('chatInput').focus();
+    }
+
+    function handleEnter(e) {
+        if (e.key === 'Enter') sendMessage();
+    }
+
+    async function sendMessage() {
+        const input = document.getElementById('chatInput');
+        const text = input.value.trim();
+        if (!text) return;
+
+        // 1. Tampilkan Pesan User
+        addMessage(text, 'user');
+        input.value = '';
+
+        // 2. Tampilkan Loading (Titik-titik)
+        const loadingId = addMessage('...', 'bot');
+
+        // 3. Kirim ke Backend
+        try {
+            const response = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: text })
+            });
+            const data = await response.json();
+
+            // Hapus Loading, Ganti dengan Jawaban
+            const loadingBubble = document.getElementById(loadingId);
+            loadingBubble.innerText = data.response;
+
+            // Jika ada link redirect
+            if (data.redirect_url) {
+                const link = document.createElement('a');
+                link.href = data.redirect_url;
+                link.innerText = "Buka Halaman →";
+                link.className = "chat-link";
+                loadingBubble.appendChild(document.createElement('br'));
+                loadingBubble.appendChild(link);
+            }
+
+        } catch (error) {
+            document.getElementById(loadingId).innerText = "Maaf, terjadi kesalahan sistem.";
+        }
+    }
+
+    function addMessage(text, sender) {
+        const div = document.createElement('div');
+        div.className = `msg msg-${sender}`;
+        div.innerText = text;
+        
+        // Buat ID unik untuk bubble ini (agar bisa diupdate kalau bot)
+        const id = 'msg-' + Date.now();
+        div.id = id;
+
+        const container = document.getElementById('chatMessages');
+        container.appendChild(div);
+        container.scrollTop = container.scrollHeight; // Auto scroll ke bawah
+        return id;
+    }
+</script>

@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIS - Manajemen User</title>
+    {% include 'session_guard.html' %}
+    <style>
+        /* Menggunakan style dasar yang sama dengan file lain */
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f0f2f5; height: 100vh; overflow: hidden; }
+        .app-container { display: flex; height: 100vh; width: 100%; }
+        .sidebar { width: 260px; background-color: #1e293b; color: #ecf0f1; display: flex; flex-direction: column; padding: 20px; flex-shrink: 0; }
+        .brand { font-size: 24px; font-weight: bold; color: #ffffff; margin-bottom: 40px; display: flex; align-items: center; gap: 10px; }
+        .brand span { color: #3b82f6; } 
+        .menu-label { font-size: 12px; text-transform: uppercase; color: #94a3b8; margin-bottom: 10px; letter-spacing: 1px; font-weight: 600; }
+        .menu-nav { list-style: none; margin-bottom: 30px; }
+        .menu-nav li { margin-bottom: 5px; }
+        .menu-nav a { text-decoration: none; color: #cbd5e1; display: block; padding: 12px 15px; border-radius: 6px; font-size: 14px; transition: 0.3s; display: flex; align-items: center; gap: 10px; }
+        .menu-nav a:hover { background-color: #334155; color: white; }
+        .menu-nav a.active { background-color: #2563eb; color: white; }
+        .main-content { flex: 1; display: flex; flex-direction: column; overflow-y: auto; padding: 20px 30px; }
+        .top-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; background: white; padding: 15px 25px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
+        .btn-logout { background-color: #ef4444; color: white; padding: 8px 15px; font-size: 12px; text-decoration: none; border-radius: 4px; }
+        
+        /* Style Khusus Halaman Ini */
+        .card { background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th { text-align: left; padding: 12px; border-bottom: 2px solid #eee; color: #64748b; font-size: 13px; font-weight: 600; text-transform: uppercase; }
+        td { padding: 12px; border-bottom: 1px solid #f1f5f9; color: #334155; font-size: 14px; }
+        
+        .form-row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+        input, select { padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+        .btn-add { background-color: #10b981; color: white; padding: 8px 15px; border: none; border-radius: 4px; cursor: pointer; }
+        .btn-del { background-color: #ef4444; color: white; padding: 5px 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }
+        .btn-update { background-color: #f59e0b; color: white; padding: 5px 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }
+        .badge { padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; background: #e0f2fe; color: #0284c7; }
+        .badge-admin { background: #dcfce7; color: #166534; }
+    </style>
+</head>
+<body>
+
+    <div class="app-container">
+        <nav class="sidebar">
+            <div class="brand"><span>AIS</span> System</div>
+            <div class="menu-label">Menu Utama</div>
+            <ul class="menu-nav">
+                <li><a href="/main_menu">Home / Statistik</a></li>
+            </ul>
+            <div class="menu-label">Laporan Utama</div>
+            <ul class="menu-nav">
+                <li><a href="/premi_statistik">Premi Statistik</a></li>
+                <li><a href="/klaim_statistik">Klaim Statistik</a></li>
+                <li><a href="#">Risk Profile</a></li>
+                <li><a href="#">Risk Profile Masa</a></li>
+            </ul>
+            <div class="menu-label">Pengaturan</div>
+            <ul class="menu-nav">
+                <li><a href="/manajemen_user" class="active">👤 Manajemen User</a></li>
+                <li><a href="#">⚙️ Konfigurasi</a></li>
+            </ul>
+            <div style="margin-top: auto;">
+                <p style="font-size: 12px; color: #64748b;">Logged in as:</p>
+                <p style="color: white; font-weight: bold;">{{ username }} ({{ role }})</p>
+            </div>
+        </nav>
+
+        <main class="main-content">
+            <div class="top-header">
+                <h2 style="color: #1e293b; font-size: 20px;">Manajemen User</h2>
+                <a href="/logout" class="btn btn-logout">Logout</a>
+            </div>
+
+            <div class="card">
+                <h3 style="margin-bottom: 15px; color: #334155;">Tambah User Baru</h3>
+                <form action="/manajemen_user/add" method="post" class="form-row">
+                    <input type="text" name="new_username" placeholder="Username" required>
+                    <input type="password" name="new_password" placeholder="Password" required>
+                    <select name="new_role">
+                        <option value="user">User Biasa</option>
+                        <option value="admin">Admin</option>
+                    </select>
+                    <button type="submit" class="btn-add">➕ Tambah</button>
+                </form>
+            </div>
+
+            <div class="card">
+                <h3 style="margin-bottom: 15px; color: #334155;">Daftar Pengguna</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Username</th>
+                            <th>Role</th>
+                            <th>Ubah Role</th>
+                            <th>Aksi</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for u in users %}
+                        <tr>
+                            <td>{{ u.id }}</td>
+                            <td>{{ u.username }}</td>
+                            <td>
+                                <span class="badge {% if u.role == 'admin' %}badge-admin{% endif %}">
+                                    {{ u.role }}
+                                </span>
+                            </td>
+                            <td>
+                                <form action="/manajemen_user/update_role" method="post" style="display:inline-flex; gap:5px;">
+                                    <input type="hidden" name="user_id" value="{{ u.id }}">
+                                    <select name="new_role" style="padding: 4px;">
+                                        <option value="user" {% if u.role == 'user' %}selected{% endif %}>User</option>
+                                        <option value="admin" {% if u.role == 'admin' %}selected{% endif %}>Admin</option>
+                                    </select>
+                                    <button type="submit" class="btn-update">Update</button>
+                                </form>
+                            </td>
+                            <td>
+                                <form action="/manajemen_user/delete" method="post" onsubmit="return confirm('Yakin hapus user ini?');">
+                                    <input type="hidden" name="user_id" value="{{ u.id }}">
+                                    <button type="submit" class="btn-del">Hapus</button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+
+        </main>
+    </div>
+
+    {% include 'chat_widget.html' %}
+
+</body>
+</html>

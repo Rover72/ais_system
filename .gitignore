@@ -1,0 +1,15 @@
+# Abaikan folder virtual environment
+venv/
+env/
+.venv/
+
+# Abaikan file cache Python
+__pycache__/
+*.pyc
+
+# Abaikan file environment variables (RAHASIA)
+.env
+
+# Abaikan folder IDE (VS Code / PyCharm)
+.vscode/
+.idea/
