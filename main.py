@@ -1,5 +1,6 @@
 import sys
 import asyncio
+import uuid
 import uvicorn
 import os
 from dotenv import load_dotenv
@@ -7,8 +8,8 @@ from starlette.middleware.sessions import SessionMiddleware
 load_dotenv()
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-from fastapi import FastAPI, Request, Form, Query
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
+from fastapi import FastAPI, Request, Form, Query, BackgroundTasks
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse, FileResponse
 from fastapi.templating import Jinja2Templates
 import psycopg
 from psycopg.rows import dict_row
@@ -16,9 +17,10 @@ from psycopg.errors import IntegrityError
 from passlib.context import CryptContext
 import pandas as pd
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List
 from pydantic import BaseModel
+from urllib.parse import urlparse, urlunparse
 
 app = FastAPI()
 
@@ -26,10 +28,41 @@ app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key="qwertyuiopasdfghjklzxcvbnm", max_age=None, same_site='lax')
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 templates = Jinja2Templates(directory="templates")
-DB_URI = os.getenv("DB_URL") 
+DB_URI = os.getenv("DB_URL")       # Koneksi ke AIS (Localhost)
+WH_DB_URI = os.getenv("WH_DB_URL") # Koneksi ke Warehouse (192.168.250.224)
 
 if not DB_URI:
     raise ValueError("DB_URL tidak ditemukan di file .env!")
+if not WH_DB_URI:
+    print("WARNING: WH_DB_URL tidak ditemukan di .env (Fitur Monitoring mungkin error)")
+
+async def get_async_db_connection():
+    # KONEKSI 1: AIS (Default/Local)
+    return await psycopg.AsyncConnection.connect(DB_URI, row_factory=dict_row)
+
+async def get_async_wh_connection():
+    # KONEKSI 2: WAREHOUSE (192.168.250.224)
+    if not WH_DB_URI: raise ValueError("WH_DB_URL belum disetting di .env")
+    return await psycopg.AsyncConnection.connect(WH_DB_URI, row_factory=dict_row)
+
+async def get_async_prod_connection():
+    # KONEKSI 3: PRODUCTION (192.168.250.52)
+    # Kita "pinjam" username/password dari WH_DB_URL karena user bilang sama.
+    if not WH_DB_URI: raise ValueError("WH_DB_URL belum disetting di .env")
+    
+    parsed = urlparse(WH_DB_URI)
+    user_pass = parsed.netloc.split('@')[0] # Ambil user:pass
+    
+    # Set IP ke Production (db_aba), Port Default 5432
+    prod_netloc = f"{user_pass}@192.168.250.52:5432"
+    
+    prod_uri = urlunparse((
+        parsed.scheme, prod_netloc, '/db_aba',
+        parsed.params, parsed.query, parsed.fragment
+    ))
+    return await psycopg.AsyncConnection.connect(prod_uri, row_factory=dict_row)
+
+download_tasks = {}
 
 # --- DEFINISI MAPPING POLICY GROUP (Hardcoded ID) ---
 POLICY_GROUP_MAPPING = {
@@ -42,6 +75,84 @@ async def get_async_db_connection():
     # Ini membuat koneksi secara asynchronous
     conn = await psycopg.AsyncConnection.connect(DB_URI, row_factory=dict_row)
     return conn
+
+async def get_async_prod_connection():
+    """
+    Membuat koneksi ke Database Production (192.168.250.52 / db_aba)
+    menggunakan kredensial yang sama dengan DB_URL utama.
+    """
+    current_uri = os.getenv("DB_URL")
+    if not current_uri:
+        raise ValueError("DB_URL tidak ditemukan.")
+
+    # Parsing URL saat ini
+    parsed = urlparse(current_uri)
+
+    # Ganti Host ke 192.168.250.52 dan Path ke /db_aba
+    # Format netloc biasanya: user:pass@hostname:port
+    # Kita ganti hostname-nya saja.
+
+    user_pass = parsed.netloc.split('@')[0] # Ambil user:pass
+    new_netloc = f"{user_pass}@192.168.250.52" # Gabung dengan IP baru
+
+    # Konstruksi ulang URL (scheme, netloc, path, params, query, fragment)
+    prod_uri = urlunparse((
+        parsed.scheme, 
+        new_netloc, 
+        '/db_aba',  # Nama database production
+        parsed.params, 
+        parsed.query, 
+        parsed.fragment
+    ))
+
+    # Return koneksi baru
+    conn = await psycopg.AsyncConnection.connect(prod_uri, row_factory=dict_row)
+    return conn
+
+# --- FUNGSI BACKGROUND TASK (PEMROSESAN CSV) ---
+async def generate_csv_background(task_id: str, query: str, params: list, filename: str):
+    """
+    Berjalan di background. Mengambil data DB -> Buat CSV -> Simpan di folder temp.
+    """
+    try:
+        download_tasks[task_id]["status"] = "Processing"
+        
+        # 1. Eksekusi Query Database
+        async with await get_async_db_connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(query, params)
+                if cur.description:
+                    columns = [col.name for col in cur.description]
+                    data = await cur.fetchall()
+                else:
+                    columns = []
+                    data = []
+
+        # 2. Proses Pandas (CPU Bound - run in thread)
+        def process_dataframe():
+            df = pd.DataFrame(data, columns=columns)
+            # Format Tanggal Otomatis
+            for col in df.columns:
+                if any(x in col.lower() for x in ['date', 'tgl', 'refd', 'periode']):
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+                    df[col] = df[col].dt.strftime('%Y-%m-%d').fillna('')
+            
+            # Simpan File
+            os.makedirs("temp_downloads", exist_ok=True)
+            file_path = f"temp_downloads/{task_id}_{filename}"
+            df.to_csv(file_path, index=False)
+            return file_path
+
+        file_path = await asyncio.to_thread(process_dataframe)
+        
+        # 3. Update Status Selesai
+        download_tasks[task_id]["status"] = "Finished"
+        download_tasks[task_id]["file_path"] = file_path
+        
+    except Exception as e:
+        download_tasks[task_id]["status"] = "Error"
+        download_tasks[task_id]["error"] = str(e)
+        print(f"Background Task Error ({task_id}): {e}")
 
 # --- ROUTES ---
 
@@ -328,9 +439,10 @@ QUERY_REPORT = """
     WHERE b.status IN ('POLICY', 'ENDORSE', 'RENEWAL')
     AND b.delete_f IS NULL
 """
-@app.get("/download_report")
-async def download_report(
-    request: Request, 
+@app.get("/trigger_download_premi")
+async def trigger_download_premi(
+    background_tasks: BackgroundTasks,
+    request: Request,
     pol_no: Optional[str] = None, 
     start_date: Optional[str] = None, 
     end_date: Optional[str] = None,
@@ -341,112 +453,86 @@ async def download_report(
     company_group: Optional[List[str]] = Query(None),
     customer: Optional[List[int]] = Query(None)
 ):
-    
-    if not request.session.get("user"):
-        return RedirectResponse(url="/", status_code=303)
+    if not request.session.get("user"): return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    # 1. Query Export (Sama dengan View)
+    final_query = """
+         SELECT 
+        a.period_start, a.period_end, a.policy_date, a.status,
+        ';' || a.pol_no AS pol_no,
+        a.grupmarketer, a.marketer, a.sumbis as sumbis_name, a.cust_name, a.ccy_rate,
+        b.ins_pol_obj_id, b.nama, b.coverage, a.kreasi_type_desc, b.ref2, b.kode_pos,
+        b.kriteria, b.risk_class, b.tgl_lahir, b.refd2, b.refd3, b.ins_risk_cat_code,
+        b.tsi_obj_rev AS tsi_obj, b.tsiko_obj, b.premi_obj_rev AS premi_obj,
+        b.premiko_obj, b.diskonko_obj, b.commko_obj, b.bfeeko_obj, b.hfeeko_obj,
+        b.disc_obj, b.komisi_obj, b.bfee_obj, b.hfee_obj, b.fbase_obj, b.ppn_obj,
+        b.building, b.machine, b.stock, b.other, b.tsi_or, b.premi_or, b.komisi_or,
+        b.tsi_bppdan, b.premi_bppdan, b.komisi_bppdan, b.tsi_kscbi, b.premi_kscbi,
+        b.komisi_kscbi, b.tsi_spl, b.premi_spl, b.komisi_spl, b.tsi_fac, b.premi_fac,
+        b.komisi_fac, b.tsi_qs, b.premi_qs, b.komisi_qs, b.tsi_park, b.premi_park,
+        b.komisi_park, b.tsi_faco, b.premi_faco, b.komisi_faco, b.tsi_faco1,
+        b.premi_faco1, b.komisi_faco1, b.tsi_faco2, b.premi_faco2, b.komisi_faco2,
+        b.tsi_faco3, b.premi_faco3, b.komisi_faco3, b.tsi_jp, b.premi_jp, b.komisi_jp,
+        b.no_pk, b.desc1, a.endorse_notes, a.cc_code as kode_cabang,
+        a.category1 as sumbis_kategori, a.cc_code_source as kode_cabang_penerbit,
+        a.pol_type_id as kode_cob, 
+        c.description as cob_description,
+        a.region_id_source AS region_source
+    FROM data_debitur b
+    INNER JOIN data_polis a ON a.pol_id = b.pol_id
+    LEFT JOIN prod_data_jenis c ON a.pol_type_id = c.pol_type_id
+    WHERE b.status IN ('POLICY', 'ENDORSE', 'RENEWAL')
+    AND b.delete_f IS NULL
     """
-    Route Download (CSV Version)
-    """
-    try:
-        if await request.is_disconnected():
-            return "Request cancelled"
+    params = []
 
-        final_query = QUERY_REPORT
-        params = []
-
-        if pol_no:
-            final_query += " AND b.pol_no ILIKE %s"
-            params.append(f"%{pol_no}%")
-        
-        if start_date:
-            final_query += " AND a.policy_date >= %s"
-            params.append(start_date)
-
-        if end_date:
-            final_query += " AND a.policy_date <= %s"
-            params.append(end_date)
-        
-        if policy_group and policy_group in POLICY_GROUP_MAPPING:
-            id_list = list(POLICY_GROUP_MAPPING[policy_group]) # Convert tuple ke list
-            final_query += " AND a.pol_type_id = ANY(%s)" # Syntax Postgres untuk array check
-            params.append(id_list)
-
-        # FILTER BUSINESS TYPE DOWNLOAD
-        if business_type == "Unit AKS":
-            final_query += " AND a.cc_code <> '80'"
-        elif business_type == "Unit NON AKS":
-            final_query += " AND a.cc_code = '80'"
-
-        # --- FILTER BRANCH DOWNLOAD ---
-        if branch:
-            final_query += " AND a.cc_code = %s"
-            params.append(branch)
-
-        if cob:
-            final_query += " AND a.pol_type_id = ANY(%s)"
-            params.append(cob)
-
-        if company_group:
-            final_query += " AND a.grups = ANY(%s)"
-            params.append(company_group)
-
-        if customer:
-            final_query += " AND a.idsumbis = ANY(%s)"
-            params.append(customer)
-            
-        # EKSEKUSI DB (ASYNC)
-        async with await get_async_db_connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(final_query, params)
-                if cur.description:
-                    columns = [col.name for col in cur.description] 
-                    data = await cur.fetchall()
-                else:
-                    columns = []
-                    data = []
-
-        # PROSES CSV (Blocking CPU task, run in thread)
-        def process_csv():
-            df = pd.DataFrame(data, columns=columns)
-            
-            # --- FORMAT TANGGAL ---
-            target_date_cols = ['period_start', 'period_end', 'policy_date', 'tgl_lahir', 'refd2', 'refd3']
-            for col in target_date_cols:
-                if col in df.columns:
-                    df[col] = pd.to_datetime(df[col], errors='coerce')
-                    df[col] = df[col].dt.strftime('%Y-%m-%d').fillna('')
-
-            # --- GENERATE CSV ---
-            output = io.StringIO()
-            df.to_csv(output, index=False)
-            return output.getvalue()
-
-        csv_content = await asyncio.to_thread(process_csv)
-        
-        # --- LOGIKA PENAMAAN FILE ---
-        tgl_awal = start_date if start_date else "ALL"
-        tgl_akhir = end_date if end_date else "ALL"
-        filename = f"premi_statistik_{tgl_awal}_sd_{tgl_akhir}.csv"
-        
-        headers = {
-            'Content-Disposition': f'attachment; filename="{filename}"'
-        }
-        
-        return StreamingResponse(
-            iter([csv_content]), 
-            headers=headers, 
-            media_type='text/csv'
-        )
-
-    except asyncio.CancelledError:
-        print("⚠️ User memutus koneksi. Download dibatalkan.")
-        raise 
-
-    except Exception as e:
-        print(f"Error: {e}")
-        return f"Terjadi kesalahan: {str(e)}"
+    if pol_no:
+        final_query += " AND (b.pol_no ILIKE %s OR b.nama ILIKE %s)"
+        params.append(f"%{pol_no}%")
+        params.append(f"%{pol_no}%")
     
-# --- [TAMBAHKAN INI DI main.py] ---
+    if start_date:
+        final_query += " AND b.refd2 >= %s"
+        params.append(start_date)
+    if end_date:
+        final_query += " AND b.refd2 <= %s"
+        params.append(end_date)
+    if policy_group and policy_group in POLICY_GROUP_MAPPING:
+        id_list = list(POLICY_GROUP_MAPPING[policy_group])
+        final_query += " AND a.pol_type_id = ANY(%s)"
+        params.append(id_list)
+    if business_type == "Unit AKS":
+        final_query += " AND a.cc_code <> '80'"
+    elif business_type == "Unit NON AKS":
+        final_query += " AND a.cc_code = '80'"
+    if branch:
+        final_query += " AND a.cc_code = %s"
+        params.append(branch)
+    if cob:
+        final_query += " AND a.pol_type_id = ANY(%s)"
+        params.append(cob)
+    if company_group:
+        final_query += " AND a.grups = ANY(%s)"
+        params.append(company_group)
+    if customer:
+        final_query += " AND a.idsumbis = ANY(%s)"
+        params.append(customer)
+
+    # 2. Register Task
+    task_id = str(uuid.uuid4())
+    filename = f"premi_statistik_{datetime.now().strftime('%Y%m%d%H%M')}.csv"
+    
+    download_tasks[task_id] = {
+        "status": "Queued",
+        "filename": filename,
+        "created_at": datetime.now().strftime("%H:%M:%S"),
+        "type": "Premi Statistik"
+    }
+    
+    background_tasks.add_task(generate_csv_background, task_id, final_query, params, filename)
+    
+    return JSONResponse({"message": "Download dimulai", "task_id": task_id})
+    
 
 @app.get("/klaim_statistik", response_class=HTMLResponse)
 async def klaim_statistik(
@@ -625,8 +711,10 @@ async def klaim_statistik(
     except Exception as e:
         return f"Error loading klaim statistik: {str(e)}"
 
-@app.get("/download_claim_report")
-async def download_claim_report(
+# --- TRIGGER DOWNLOAD KLAIM (BACKGROUND) ---
+@app.get("/trigger_download_claim")
+async def trigger_download_claim(
+    background_tasks: BackgroundTasks,
     request: Request, 
     start_date: Optional[str] = None, 
     end_date: Optional[str] = None,
@@ -639,18 +727,14 @@ async def download_claim_report(
     marketer: Optional[List[str]] = Query(None),
     customer: Optional[List[int]] = Query(None)
 ):
-    
-    if not request.session.get("user"):
-        return RedirectResponse(url="/", status_code=303)
+    if not request.session.get("user"): return JSONResponse({"error": "Unauthorized"}, status_code=401)
     
     """
     Download Excel (CSV) untuk Data Klaim (SELECT *)
     """
-    try:
-        if await request.is_disconnected():
-            return "Request cancelled"
+ 
 
-        final_query = """
+    final_query = """
                     SELECT 
                     cc_code, pol_type_id, policy_date, approved_date, claim_date, claim_propose_date, pla_date, dla_date, pol_id, 
                     ins_pol_obj_id, ';' || pol_no as pol_no, ';' || sub_polno as sub_polno, pla_no, dla_no, cust_name, nama, tgl_lahir, ccy_rate, ccy_rate_claim, insured_amount, claim_amount, 
@@ -668,94 +752,58 @@ async def download_claim_report(
                     WHERE 1=1 
                 """
         
-        params = []
+    params = []
         
         # --- LOGIKA FILTER (SAMA DENGAN VIEW) ---
-        if start_date:
-            final_query += " AND approved_date >= %s"
-            params.append(start_date)
+    if start_date:
+        final_query += " AND approved_date >= %s"
+        params.append(start_date)
+    if end_date:
+        final_query += " AND approved_date <= %s"
+        params.append(end_date)
+    if policy_group and policy_group in POLICY_GROUP_MAPPING:
+        id_list = list(POLICY_GROUP_MAPPING[policy_group])
+        final_query += " AND pol_type_id = ANY(%s)"
+        params.append(id_list)
+    if business_type == "Unit AKS":
+        final_query += " AND cc_code <> '80'"
+    elif business_type == "Unit NON AKS":
+        final_query += " AND cc_code = '80'"
+    if branch:
+        final_query += " AND cc_code = %s"
+        params.append(branch)
+    if cob:
+        final_query += " AND pol_type_id = ANY(%s)"
+        params.append(cob)
+    if company_group:
+        final_query += " AND grups = ANY(%s)"
+        params.append(company_group)
+    if company_group_marketer:
+        final_query += " AND grupm = ANY(%s)"
+        params.append(company_group_marketer)
+    if marketer:
+        final_query += " AND idmarketer = ANY(%s)"
+        params.append(marketer)
+    if customer:
+        final_query += " AND idsumbis = ANY(%s)"
+        params.append(customer)
 
-        if end_date:
-            final_query += " AND approved_date <= %s"
-            params.append(end_date)
-        
-        if policy_group and policy_group in POLICY_GROUP_MAPPING:
-            id_list = list(POLICY_GROUP_MAPPING[policy_group])
-            final_query += " AND pol_type_id = ANY(%s)"
-            params.append(id_list)
+    final_query += " ORDER BY dla_no, pol_no, order_no"
 
-        if business_type == "Unit AKS":
-            final_query += " AND cc_code <> '80'"
-        elif business_type == "Unit NON AKS":
-            final_query += " AND cc_code = '80'"
-
-        if branch:
-            final_query += " AND cc_code = %s"
-            params.append(branch)
-
-        if cob:
-            final_query += " AND pol_type_id = ANY(%s)"
-            params.append(cob)
-
-        if company_group:
-            final_query += " AND grups = ANY(%s)"
-            params.append(company_group)
-
-        if company_group_marketer:
-            final_query += " AND grupm = ANY(%s)"
-            params.append(company_group_marketer)
-
-        if marketer:
-            final_query += " AND idmarketer = ANY(%s)"
-            params.append(marketer)
-
-        if customer:
-            final_query += " AND idsumbis = ANY(%s)"
-            params.append(customer)
-        
-        final_query += " ORDER BY dla_no, pol_no, order_no"
-
-        # EKSEKUSI DB
-        async with await get_async_db_connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(final_query, params)
-                if cur.description:
-                    columns = [col.name for col in cur.description] 
-                    data = await cur.fetchall()
-                else:
-                    columns = []
-                    data = []
-
-        # PROSES CSV
-        def process_csv():
-            df = pd.DataFrame(data, columns=columns)
-            
-            # Format tanggal umum jika ada kolom tanggal
-            for col in df.columns:
-                if 'date' in col.lower() or 'tgl' in col.lower():
-                    df[col] = pd.to_datetime(df[col], errors='coerce')
-                    df[col] = df[col].dt.strftime('%Y-%m-%d').fillna('')
-
-            output = io.StringIO()
-            df.to_csv(output, index=False)
-            return output.getvalue()
-
-        csv_content = await asyncio.to_thread(process_csv)
-        
-        filename = f"klaim_statistik_{datetime.now().strftime('%Y%m%d')}.csv"
-        
-        headers = {
-            'Content-Disposition': f'attachment; filename="{filename}"'
-        }
-        
-        return StreamingResponse(
-            iter([csv_content]), 
-            headers=headers, 
-            media_type='text/csv'
-        )
-
-    except Exception as e:
-        return f"Terjadi kesalahan: {str(e)}"
+    # 2. Register Task
+    task_id = str(uuid.uuid4())
+    filename = f"klaim_statistik_{datetime.now().strftime('%Y%m%d%H%M')}.csv"
+    
+    download_tasks[task_id] = {
+        "status": "Queued",
+        "filename": filename,
+        "created_at": datetime.now().strftime("%H:%M:%S"),
+        "type": "Klaim Statistik"
+    }
+    
+    background_tasks.add_task(generate_csv_background, task_id, final_query, params, filename)
+    
+    return JSONResponse({"message": "Download dimulai", "task_id": task_id})
     
 # --- MANAJEMEN USER ROUTES ---
 
@@ -836,8 +884,178 @@ async def update_user_role(request: Request, user_id: int = Form(...), new_role:
     except Exception as e:
         return f"Gagal update role: {e}"
     
+# --- MONITORING & DOWNLOAD FILE ROUTES ---
+
+@app.get("/monitoring_download", response_class=HTMLResponse)
+async def page_monitoring(request: Request):
+    username = request.session.get("user")
+    role = request.session.get("role")
+    if not username: return RedirectResponse(url="/", status_code=303)
+    
+    return templates.TemplateResponse("monitoring_download.html", {
+        "request": request, "username": username, "role": role,
+        "tasks": download_tasks 
+    })
+
+@app.get("/download_file/{task_id}")
+async def download_file_result(task_id: str):
+    task = download_tasks.get(task_id)
+    if not task or task['status'] != 'Finished':
+        return HTMLResponse("File belum siap atau tidak ditemukan", status_code=404)
+    
+    return FileResponse(
+        path=task['file_path'], 
+        filename=task['filename'], 
+        media_type='text/csv'
+    )
+    
 class ChatRequest(BaseModel):
     message: str
+
+
+# --- [TAMBAHAN FITUR: WAREHOUSE MONITORING] ---
+# --- UPDATE WAREHOUSE MONITORING (DENGAN DEBUG & FIX TANGGAL) ---
+
+@app.get("/warehouse_monitoring", response_class=HTMLResponse)
+async def warehouse_monitoring(
+    request: Request,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    # Cek Login (Pakai Session dari DB AIS - Aman)
+    username = request.session.get("user")
+    role = request.session.get("role")
+    if not username:
+        return RedirectResponse(url="/", status_code=303)
+
+    # --- LOGIKA TANGGAL DEFAULT ---
+    if not start_date or not end_date:
+        today = datetime.now()
+        if today.day == 1:
+            end_date_obj = today - timedelta(days=1)
+            start_date_obj = end_date_obj.replace(day=1)
+        else:
+            start_date_obj = today.replace(day=1)
+            end_date_obj = today - timedelta(days=1)
+        
+        if not start_date: start_date = start_date_obj.strftime('%Y-%m-%d')
+        if not end_date: end_date = end_date_obj.strftime('%Y-%m-%d')
+
+    try:
+        # --- 1. AMBIL DATA DARI PRODUCTION (db_aba) ---
+        async with await get_async_prod_connection() as conn_prod:
+            async with conn_prod.cursor() as cur:
+                # ... (Query q_prod SAMA PERSIS dengan sebelumnya) ...
+                q_prod = """
+                    select count(pol_id) as cnt, sum(tsi) as tsi, sum(premi_total) as premi, 
+                    sum(diskon) as diskon, sum(komisi) as komisi, sum(ppn) as ppn,
+                    sum(bfee) as bfee, sum(hfee) as hfee, sum(komisi_tax) as tax_komisi
+                    from ( 
+                        select a.pol_id,
+                        sum(getpremi2(b.entity_id=1,coalesce(a.insured_amount,0))) as tsi, 
+                        sum(getpremi2(b.entity_id=1,coalesce(a.premi_total,0))) as premi_total,
+                        sum(getpremi2(b.entity_id=1,coalesce(a.nd_disc1,0))) as diskon,
+                        sum(getpremi2(b.entity_id=1,coalesce(a.nd_comm1,0))) as komisi,
+                        sum(getpremi2(b.entity_id=1,coalesce(a.nd_ppn,0))) as ppn,
+                        sum(getpremi2(b.entity_id=1,coalesce(a.nd_brok1,0))) as bfee,
+                        sum(getpremi2(b.entity_id=1,coalesce(a.nd_hfee,0))) as hfee,
+                        sum(getpremi2(b.entity_id=1,coalesce(a.nd_taxcomm1,0))) as komisi_tax
+                        from (
+                            select a.status, a.pol_id, a.ccy_rate, a.entity_id, a.prod_id,
+                            getpremi(a.status = 'ENDORSE',a.insured_amount_e*a.ccy_rate,a.insured_amount*a.ccy_rate) as insured_amount,
+                            NULLIF(a.premi_total*ccy_rate,0) as premi_total,
+                            coalesce((select sum(x.amount*a.ccy_rate) from ins_pol_items x where x.ins_item_id in (25,18,32,11,112,116,117) and a.pol_id = x.pol_id),0) as nd_comm1,
+                            coalesce((select sum(x.tax_amount*a.ccy_rate) from ins_pol_items x where x.ins_item_id in (25,18,32,11,112,116,117) and x.tax_code in (1,2) and a.pol_id = x.pol_id),0) as nd_taxcomm1,
+                            coalesce((select sum(x.amount*a.ccy_rate) from ins_pol_items x where x.ins_item_id in (26,19,33,12,88,89,90,105,106,107,108) and a.pol_id = x.pol_id),0) as nd_brok1,
+                            coalesce((select sum(x.amount*a.ccy_rate) from ins_pol_items x where x.ins_item_id in (27,20,34,13) and a.pol_id = x.pol_id),0) as nd_hfee,
+                            coalesce((select sum(x.amount*a.ccy_rate) from ins_pol_items x where x.ins_item_id in (30,23,37,16) and a.pol_id = x.pol_id),0) as nd_disc1,
+                            coalesce((select sum(x.amount*a.ccy_rate) from ins_pol_items x where x.ins_item_id in (59,58,71,101,57,76,78,85,86,87,91,113,114,115) and a.pol_id = x.pol_id),0) as nd_ppn
+                            FROM ins_policy a      
+                            WHERE a.status IN ('POLICY','RENEWAL','ENDORSE') 
+                            AND a.active_flag = 'Y' AND a.effective_flag = 'Y' 
+                            AND date_trunc('day', a.approved_date)::date >= %s::date 
+                            AND date_trunc('day', a.approved_date)::date <= %s::date
+                        ) a 
+                        inner join ins_pol_coins b on b.policy_id = a.pol_id 
+                        where (b.entity_id <> 1 or b.coins_type <> 'COINS_COVER') 
+                        group by a.pol_id
+                    ) x
+                """
+                await cur.execute(q_prod, (start_date, end_date))
+                res_prod = await cur.fetchone()
+
+        # --- 2. AMBIL DATA DARI WAREHOUSE (Gunakan get_async_wh_connection) ---
+        async with await get_async_wh_connection() as conn_wh:
+            async with conn_wh.cursor() as cur:
+                # Query WH Data Polis
+                q_wh_pol = """
+                    SELECT 
+                        count(pol_id) as cnt,
+                        SUM(tsi) AS tsi, SUM(premi_total) AS premi, SUM(diskon) AS diskon,
+                        SUM(komisi) AS komisi, SUM(ppn) AS ppn,
+                        SUM(bfee) AS bfee, SUM(hfee) AS hfee, SUM(tax_komisi21 + tax_komisi23) AS tax_komisi
+                    FROM data_polis
+                    WHERE status IN ('POLICY', 'RENEWAL', 'ENDORSE')
+                    AND date_trunc('day', approved_date)::date >= %s::date
+                    AND date_trunc('day', approved_date)::date <= %s::date
+                """
+                await cur.execute(q_wh_pol, (start_date, end_date))
+                res_wh_pol = await cur.fetchone()
+
+                # Query WH Data Debitur
+                q_wh_deb = """
+                    SELECT 
+                        count(distinct pol_id) as cnt,
+                        SUM(tsi_obj_rev) AS tsi, SUM(premi_obj_rev) AS premi, SUM(disc_obj) AS diskon,
+                        SUM(komisi_obj) AS komisi, SUM(ppn_obj) AS ppn,
+                        SUM(bfee_obj) AS bfee, SUM(hfee_obj) AS hfee, SUM(komisitax_obj) AS tax_komisi
+                    FROM data_debitur
+                    WHERE delete_f IS NULL 
+                    AND status IN ('POLICY', 'RENEWAL', 'ENDORSE')
+                    AND date_trunc('day', approved_date)::date >= %s::date
+                    AND date_trunc('day', approved_date)::date <= %s::date
+                """
+                await cur.execute(q_wh_deb, (start_date, end_date))
+                res_wh_deb = await cur.fetchone()
+
+        # --- 3. HITUNG SELISIH ---
+        def safe_get(d, key):
+            return float(d[key]) if d and d[key] is not None else 0.0
+
+        sources = [
+            {"name": "Production (db_aba)", "data": res_prod, "color": "bg-blue-100"},
+            {"name": "WH - Data Polis", "data": res_wh_pol, "color": "bg-green-100"},
+            {"name": "WH - Data Debitur", "data": res_wh_deb, "color": "bg-yellow-100"}
+        ]
+
+        diff_prod_pol = {
+            "cnt": safe_get(res_prod, 'cnt') - safe_get(res_wh_pol, 'cnt'),
+            "tsi": safe_get(res_prod, 'tsi') - safe_get(res_wh_pol, 'tsi'),
+            "premi": safe_get(res_prod, 'premi') - safe_get(res_wh_pol, 'premi'),
+            "ppn": safe_get(res_prod, 'ppn') - safe_get(res_wh_pol, 'ppn')
+        }
+        
+        diff_prod_deb = {
+            "cnt": safe_get(res_prod, 'cnt') - safe_get(res_wh_deb, 'cnt'),
+            "tsi": safe_get(res_prod, 'tsi') - safe_get(res_wh_deb, 'tsi'),
+            "premi": safe_get(res_prod, 'premi') - safe_get(res_wh_deb, 'premi'),
+            "ppn": safe_get(res_prod, 'ppn') - safe_get(res_wh_deb, 'ppn')
+        }
+
+    except Exception as e:
+        return f"Error Fetching Monitoring Data: {str(e)}"
+
+    return templates.TemplateResponse("warehouse_monitoring.html", {
+        "request": request,
+        "username": username,
+        "role": role,
+        "start_date": start_date,
+        "end_date": end_date,
+        "sources": sources,
+        "diff_prod_pol": diff_prod_pol,
+        "diff_prod_deb": diff_prod_deb
+    })
+
 
 @app.post("/api/chat")
 async def chat_endpoint(chat_req: ChatRequest):

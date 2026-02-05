@@ -51,6 +51,8 @@
             <div class="menu-label">Menu Utama</div>
             <ul class="menu-nav">
                 <li><a href="/main_menu">Home / Statistik</a></li>
+                <li><a href="/monitoring_download">Monitoring Download</a></li>
+                <li><a href="/warehouse_monitoring">Warehouse Monitoring</a></li>
             </ul>
             <div class="menu-label">Laporan Utama</div>
             <ul class="menu-nav">
@@ -324,7 +326,25 @@
             selectedMarketers.forEach(val => { url += `&marketer=${encodeURIComponent(val)}`; });
             selectedCustomers.forEach(val => { url += `&customer=${val}`; });
 
-            window.location.href = url;
+            fetch(url)
+                .then(response => response.json())
+                .then(data => {
+                    if(data.task_id) {
+                        // Tampilkan konfirmasi ke user
+                        const goToMonitor = confirm("Proses download dimulai di latar belakang!\n\nApakah Anda ingin membuka halaman Monitoring Download sekarang?");
+                        if (goToMonitor) {
+                            window.location.href = "/monitoring_download";
+                        }
+                    } else {
+                        alert("Gagal memulai download: " + JSON.stringify(data));
+                    }
+                })
+                .catch(err => {
+                    console.error(err);
+                    alert("Terjadi kesalahan koneksi.");
+                });
+
+            
         }
     </script>
 

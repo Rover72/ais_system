@@ -56,6 +56,8 @@
             <div class="menu-label">Menu Utama</div>
             <ul class="menu-nav">
                 <li><a href="/main_menu">Home / Statistik</a></li>
+                <li><a href="/monitoring_download">Monitoring Download</a></li>
+                <li><a href="/warehouse_monitoring">Warehouse Monitoring</a></li>
             </ul>
             <div class="menu-label">Laporan Utama</div>
             <ul class="menu-nav">
@@ -288,7 +290,7 @@
             const customerSelect = document.getElementById('customer');
             const selectedCustomers = Array.from(customerSelect.selectedOptions).map(option => option.value);
 
-            let url = `/download_report?dummy=1`;
+            let url = `/trigger_download_premi?dummy=1`;
             
             if (polNo) url += `&pol_no=${encodeURIComponent(polNo)}`;
             if (startDate) url += `&start_date=${startDate}`;
@@ -300,8 +302,26 @@
             selectedCobs.forEach(val => { url += `&cob=${val}`; });
             selectedGroups.forEach(val => { url += `&company_group=${encodeURIComponent(val)}`; }); // Encode karena group mungkin ada spasi
             selectedCustomers.forEach(val => { url += `&customer=${val}`; });
+
+            fetch(url)
+                .then(response => response.json())
+                .then(data => {
+                    if(data.task_id) {
+                        // Tampilkan konfirmasi ke user
+                        const goToMonitor = confirm("Proses download dimulai di latar belakang!\n\nApakah Anda ingin membuka halaman Monitoring Download sekarang?");
+                        if (goToMonitor) {
+                            window.location.href = "/monitoring_download";
+                        }
+                    } else {
+                        alert("Gagal memulai download: " + JSON.stringify(data));
+                    }
+                })
+                .catch(err => {
+                    console.error(err);
+                    alert("Terjadi kesalahan koneksi.");
+                });
             
-            window.location.href = url;
+            
         }
     </script>
 
