@@ -1,13 +1,26 @@
 import sys
 import asyncio
+
+# ==========================================
+# 1. FIX KRISIAL: WINDOWS EVENT LOOP
+# ==========================================
+# Kode ini HARUS berada di baris paling atas sebelum import library lain
+# agar Uvicorn/Python tidak sempat memuat default ProactorLoop.
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+# ==========================================
+# 2. IMPORTS
+# ==========================================
 import uuid
 import uvicorn
 import os
 from dotenv import load_dotenv
 from starlette.middleware.sessions import SessionMiddleware
+
+# Load environment variables (.env)
 load_dotenv()
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from fastapi import FastAPI, Request, Form, Query, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse, FileResponse
 from fastapi.templating import Jinja2Templates
@@ -28,32 +41,31 @@ app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key="qwertyuiopasdfghjklzxcvbnm", max_age=None, same_site='lax')
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 templates = Jinja2Templates(directory="templates")
-DB_URI = os.getenv("DB_URL")       # Koneksi ke AIS (Localhost)
-WH_DB_URI = os.getenv("WH_DB_URL") # Koneksi ke Warehouse (192.168.250.224)
 
-if not DB_URI:
-    raise ValueError("DB_URL tidak ditemukan di file .env!")
-if not WH_DB_URI:
-    print("WARNING: WH_DB_URL tidak ditemukan di .env (Fitur Monitoring mungkin error)")
+
+PRIMARY_DB_URI = os.getenv("WH_DB_URL")
+
+if not PRIMARY_DB_URI:
+    # Fallback error message jika .env belum diset
+    print("❌ ERROR: WH_DB_URL tidak ditemukan di file .env!")
+    print("   Pastikan isi .env Anda memiliki baris: WH_DB_URL=postgresql://...")
 
 async def get_async_db_connection():
     # KONEKSI 1: AIS (Default/Local)
-    return await psycopg.AsyncConnection.connect(DB_URI, row_factory=dict_row)
+    return await psycopg.AsyncConnection.connect(PRIMARY_DB_URI, row_factory=dict_row)
 
 async def get_async_wh_connection():
     # KONEKSI 2: WAREHOUSE (192.168.250.224)
-    if not WH_DB_URI: raise ValueError("WH_DB_URL belum disetting di .env")
-    return await psycopg.AsyncConnection.connect(WH_DB_URI, row_factory=dict_row)
+    return await psycopg.AsyncConnection.connect(PRIMARY_DB_URI, row_factory=dict_row)
 
 async def get_async_prod_connection():
-    # KONEKSI 3: PRODUCTION (192.168.250.52)
-    # Kita "pinjam" username/password dari WH_DB_URL karena user bilang sama.
-    if not WH_DB_URI: raise ValueError("WH_DB_URL belum disetting di .env")
+    if not PRIMARY_DB_URI: raise ValueError("WH_DB_URL belum disetting")
     
-    parsed = urlparse(WH_DB_URI)
-    user_pass = parsed.netloc.split('@')[0] # Ambil user:pass
+    # Parsing URL Warehouse untuk ambil user/pass
+    parsed = urlparse(PRIMARY_DB_URI)
+    user_pass = parsed.netloc.split('@')[0] 
     
-    # Set IP ke Production (db_aba), Port Default 5432
+    # Set IP ke Production (db_aba) port 5432
     prod_netloc = f"{user_pass}@192.168.250.52:5432"
     
     prod_uri = urlunparse((
@@ -71,43 +83,6 @@ POLICY_GROUP_MAPPING = {
     "AKS Non Konsumtif": (21,38,45,46,47,48,51,52,53,54,55,56,57,58,60,73,74,75,76,77,78,80,97)
 }
 
-async def get_async_db_connection():
-    # Ini membuat koneksi secara asynchronous
-    conn = await psycopg.AsyncConnection.connect(DB_URI, row_factory=dict_row)
-    return conn
-
-async def get_async_prod_connection():
-    """
-    Membuat koneksi ke Database Production (192.168.250.52 / db_aba)
-    menggunakan kredensial yang sama dengan DB_URL utama.
-    """
-    current_uri = os.getenv("DB_URL")
-    if not current_uri:
-        raise ValueError("DB_URL tidak ditemukan.")
-
-    # Parsing URL saat ini
-    parsed = urlparse(current_uri)
-
-    # Ganti Host ke 192.168.250.52 dan Path ke /db_aba
-    # Format netloc biasanya: user:pass@hostname:port
-    # Kita ganti hostname-nya saja.
-
-    user_pass = parsed.netloc.split('@')[0] # Ambil user:pass
-    new_netloc = f"{user_pass}@192.168.250.52" # Gabung dengan IP baru
-
-    # Konstruksi ulang URL (scheme, netloc, path, params, query, fragment)
-    prod_uri = urlunparse((
-        parsed.scheme, 
-        new_netloc, 
-        '/db_aba',  # Nama database production
-        parsed.params, 
-        parsed.query, 
-        parsed.fragment
-    ))
-
-    # Return koneksi baru
-    conn = await psycopg.AsyncConnection.connect(prod_uri, row_factory=dict_row)
-    return conn
 
 # --- FUNGSI BACKGROUND TASK (PEMROSESAN CSV) ---
 async def generate_csv_background(task_id: str, query: str, params: list, filename: str):
@@ -169,7 +144,7 @@ async def login_user(request: Request, username: str = Form(...), password: str 
     try:
         async with await get_async_db_connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+                await cur.execute("SELECT * FROM ais_users WHERE username = %s", (username,))
                 user = await cur.fetchone() 
             
                 if user and pwd_context.verify(password, user['password_hash']):
@@ -195,7 +170,7 @@ async def register_user(request: Request, username: str = Form(...), password: s
         async with await get_async_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'user')",
+                    "INSERT INTO ais_users (username, password_hash, role) VALUES (%s, %s, 'user')",
                     (username, hashed_password)
                 )
                 await conn.commit()
@@ -823,7 +798,7 @@ async def page_manajemen_user(request: Request):
     try:
         async with await get_async_db_connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT id, username, role FROM users ORDER BY id ASC")
+                await cur.execute("SELECT id, username, role FROM ais_users ORDER BY id ASC")
                 users = await cur.fetchall()
         
         return templates.TemplateResponse("manajemen_user.html", {
@@ -845,7 +820,7 @@ async def add_user(request: Request, new_username: str = Form(...), new_password
         async with await get_async_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
+                    "INSERT INTO ais_users (username, password_hash, role) VALUES (%s, %s, %s)",
                     (new_username, hashed_pwd, new_role)
                 )
                 await conn.commit()
@@ -864,7 +839,7 @@ async def delete_user(request: Request, user_id: int = Form(...)):
     try:
         async with await get_async_db_connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
+                await cur.execute("DELETE FROM ais_users WHERE id = %s", (user_id,))
                 await conn.commit()
         return RedirectResponse(url="/manajemen_user", status_code=303)
     except Exception as e:
@@ -878,7 +853,7 @@ async def update_user_role(request: Request, user_id: int = Form(...), new_role:
     try:
         async with await get_async_db_connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("UPDATE users SET role = %s WHERE id = %s", (new_role, user_id))
+                await cur.execute("UPDATE ais_users SET role = %s WHERE id = %s", (new_role, user_id))
                 await conn.commit()
         return RedirectResponse(url="/manajemen_user", status_code=303)
     except Exception as e:
