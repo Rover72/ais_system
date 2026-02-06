@@ -1,20 +1,16 @@
 import sys
 import asyncio
 
-# ==========================================
-# 1. FIX KRISIAL: WINDOWS EVENT LOOP
-# ==========================================
-# Kode ini HARUS berada di baris paling atas sebelum import library lain
-# agar Uvicorn/Python tidak sempat memuat default ProactorLoop.
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # ==========================================
-# 2. IMPORTS
+# 1. IMPORTS
 # ==========================================
 import uuid
 import uvicorn
 import os
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -26,6 +22,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse,
 from fastapi.templating import Jinja2Templates
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 from psycopg.errors import IntegrityError
 from passlib.context import CryptContext
 import pandas as pd
@@ -35,44 +32,79 @@ from typing import Optional, List
 from pydantic import BaseModel
 from urllib.parse import urlparse, urlunparse
 
-app = FastAPI()
+# ==========================================
+# 2. SETUP CONNECTION POOLING (LIFESPAN)
+# ==========================================
+# Variabel Global untuk Pool
+pool_wh = None
+pool_prod = None
 
-# --- SETUP ---
-app.add_middleware(SessionMiddleware, secret_key="qwertyuiopasdfghjklzxcvbnm", max_age=None, same_site='lax')
-pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
-templates = Jinja2Templates(directory="templates")
+# Ambil URL dari ENV
+WH_DB_URI = os.getenv("WH_DB_URL")
 
+if not WH_DB_URI:
+    print("❌ ERROR: WH_DB_URL tidak ditemukan di .env!")
 
-PRIMARY_DB_URI = os.getenv("WH_DB_URL")
-
-if not PRIMARY_DB_URI:
-    # Fallback error message jika .env belum diset
-    print("❌ ERROR: WH_DB_URL tidak ditemukan di file .env!")
-    print("   Pastikan isi .env Anda memiliki baris: WH_DB_URL=postgresql://...")
-
-async def get_async_db_connection():
-    # KONEKSI 1: AIS (Default/Local)
-    return await psycopg.AsyncConnection.connect(PRIMARY_DB_URI, row_factory=dict_row)
-
-async def get_async_wh_connection():
-    # KONEKSI 2: WAREHOUSE (192.168.250.224)
-    return await psycopg.AsyncConnection.connect(PRIMARY_DB_URI, row_factory=dict_row)
-
-async def get_async_prod_connection():
-    if not PRIMARY_DB_URI: raise ValueError("WH_DB_URL belum disetting")
-    
-    # Parsing URL Warehouse untuk ambil user/pass
-    parsed = urlparse(PRIMARY_DB_URI)
-    user_pass = parsed.netloc.split('@')[0] 
-    
-    # Set IP ke Production (db_aba) port 5432
+# Buat URL Production secara dinamis dari URL Warehouse
+PROD_DB_URI = None
+if WH_DB_URI:
+    parsed = urlparse(WH_DB_URI)
+    user_pass = parsed.netloc.split('@')[0]
     prod_netloc = f"{user_pass}@192.168.250.52:5432"
-    
-    prod_uri = urlunparse((
+    PROD_DB_URI = urlunparse((
         parsed.scheme, prod_netloc, '/db_aba',
         parsed.params, parsed.query, parsed.fragment
     ))
-    return await psycopg.AsyncConnection.connect(prod_uri, row_factory=dict_row)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Fitur ini akan dijalankan SATU KALI saat aplikasi start.
+    Kita membuka koneksi database di sini agar siap pakai (Cepat).
+    """
+    global pool_wh, pool_prod
+    
+    print("🔌 Membuka Koneksi Database Pool...")
+    
+    # 1. Init Pool Warehouse
+    if WH_DB_URI:
+        pool_wh = AsyncConnectionPool(
+            conninfo=WH_DB_URI,
+            min_size=1,  # Minimal 1 koneksi standby
+            max_size=10, # Maksimal 10 koneksi concurrent
+            kwargs={"row_factory": dict_row},
+            open=False
+        )
+        await pool_wh.open()
+        print("✅ Pool Warehouse: READY")
+
+    # 2. Init Pool Production
+    if PROD_DB_URI:
+        pool_prod = AsyncConnectionPool(
+            conninfo=PROD_DB_URI,
+            min_size=1,
+            max_size=5,
+            kwargs={"row_factory": dict_row},
+            open=False
+        )
+        await pool_prod.open()
+        print("✅ Pool Production: READY")
+    
+    yield # Aplikasi berjalan di titik ini
+    
+    # Clean up saat aplikasi mati
+    print("🔌 Menutup Koneksi Database...")
+    if pool_wh: await pool_wh.close()
+    if pool_prod: await pool_prod.close()
+
+app = FastAPI(lifespan=lifespan)
+
+# ==========================================
+# 3. MIDDLEWARE & TEMPLATES
+# ==========================================
+app.add_middleware(SessionMiddleware, secret_key="qwertyuiopasdfghjklzxcvbnm", max_age=None, same_site='lax')
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+templates = Jinja2Templates(directory="templates")
 
 download_tasks = {}
 
@@ -93,7 +125,7 @@ async def generate_csv_background(task_id: str, query: str, params: list, filena
         download_tasks[task_id]["status"] = "Processing"
         
         # 1. Eksekusi Query Database
-        async with await get_async_db_connection() as conn:
+        async with pool_wh.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(query, params)
                 if cur.description:
@@ -142,7 +174,7 @@ async def show_login_page(request: Request):
 async def login_user(request: Request, username: str = Form(...), password: str = Form(...)):
     """ Route Login dengan Session """
     try:
-        async with await get_async_db_connection() as conn:
+        async with pool_wh.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT * FROM ais_users WHERE username = %s", (username,))
                 user = await cur.fetchone() 
@@ -167,7 +199,7 @@ async def show_register(request: Request):
 async def register_user(request: Request, username: str = Form(...), password: str = Form(...)):
     try:
         hashed_password = pwd_context.hash(password)
-        async with await get_async_db_connection() as conn:
+        async with pool_wh.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "INSERT INTO ais_users (username, password_hash, role) VALUES (%s, %s, 'user')",
@@ -203,7 +235,7 @@ async def main_menu(request: Request): # Hapus parameter username: str = Query(.
         return RedirectResponse(url="/", status_code=303) # Tendang ke login jika belum login
 
     try:
-        async with await get_async_db_connection() as conn:
+        async with pool_wh.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT status, SUM(premi_total) as total FROM data_polis GROUP BY status")
                 data_status = await cur.fetchall()
@@ -237,7 +269,7 @@ async def search_customers(q: str = Query(..., min_length=2)): # Minimal ketik 2
     Hanya mengambil max 50 data yang sesuai keyword.
     """
     try:
-        async with await get_async_db_connection() as conn:
+        async with pool_wh.connection() as conn:
             async with conn.cursor() as cur:
                 search_pattern = f"%{q}%"
                 await cur.execute("SELECT ent_id, ent_name FROM prod_data_master WHERE ent_name ILIKE %s ORDER BY ent_name LIMIT 50", (search_pattern,))
@@ -270,7 +302,7 @@ async def premi_statistik(
     
     try:
         # 1. Fetch COB List untuk dropdown
-        async with await get_async_db_connection() as conn:
+        async with pool_wh.connection() as conn:
             async with conn.cursor() as cur:
                 # Asumsi tabel prod_data_jenis punya kolom description
                 await cur.execute("SELECT pol_type_id, description FROM prod_data_jenis ORDER BY description")
@@ -534,7 +566,7 @@ async def klaim_statistik(
         return RedirectResponse(url="/", status_code=303)
     
     try:
-        async with await get_async_db_connection() as conn:
+        async with pool_wh.connection() as conn:
             async with conn.cursor() as cur:
                 # 1. Fetch Dropdown Data
                 await cur.execute("SELECT pol_type_id, description FROM prod_data_jenis ORDER BY description")
@@ -796,7 +828,7 @@ async def page_manajemen_user(request: Request):
 
     # 2. Ambil Daftar User
     try:
-        async with await get_async_db_connection() as conn:
+        async with pool_wh.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT id, username, role FROM ais_users ORDER BY id ASC")
                 users = await cur.fetchall()
@@ -817,7 +849,7 @@ async def add_user(request: Request, new_username: str = Form(...), new_password
     
     try:
         hashed_pwd = pwd_context.hash(new_password)
-        async with await get_async_db_connection() as conn:
+        async with pool_wh.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "INSERT INTO ais_users (username, password_hash, role) VALUES (%s, %s, %s)",
@@ -837,7 +869,7 @@ async def delete_user(request: Request, user_id: int = Form(...)):
     # Anda bisa cek user_id vs session username di db
 
     try:
-        async with await get_async_db_connection() as conn:
+        async with pool_wh.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM ais_users WHERE id = %s", (user_id,))
                 await conn.commit()
@@ -851,7 +883,7 @@ async def update_user_role(request: Request, user_id: int = Form(...), new_role:
     if request.session.get("role") != 'admin': return RedirectResponse(url="/main_menu", status_code=303)
 
     try:
-        async with await get_async_db_connection() as conn:
+        async with pool_wh.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("UPDATE ais_users SET role = %s WHERE id = %s", (new_role, user_id))
                 await conn.commit()
@@ -918,49 +950,78 @@ async def warehouse_monitoring(
 
     try:
         # --- 1. AMBIL DATA DARI PRODUCTION (db_aba) ---
-        async with await get_async_prod_connection() as conn_prod:
+        async with pool_prod.connection() as conn_prod:
             async with conn_prod.cursor() as cur:
-                # ... (Query q_prod SAMA PERSIS dengan sebelumnya) ...
+
                 q_prod = """
-                    select count(pol_id) as cnt, sum(tsi) as tsi, sum(premi_total) as premi, 
-                    sum(diskon) as diskon, sum(komisi) as komisi, sum(ppn) as ppn,
-                    sum(bfee) as bfee, sum(hfee) as hfee, sum(komisi_tax) as tax_komisi
-                    from ( 
-                        select a.pol_id,
-                        sum(getpremi2(b.entity_id=1,coalesce(a.insured_amount,0))) as tsi, 
-                        sum(getpremi2(b.entity_id=1,coalesce(a.premi_total,0))) as premi_total,
-                        sum(getpremi2(b.entity_id=1,coalesce(a.nd_disc1,0))) as diskon,
-                        sum(getpremi2(b.entity_id=1,coalesce(a.nd_comm1,0))) as komisi,
-                        sum(getpremi2(b.entity_id=1,coalesce(a.nd_ppn,0))) as ppn,
-                        sum(getpremi2(b.entity_id=1,coalesce(a.nd_brok1,0))) as bfee,
-                        sum(getpremi2(b.entity_id=1,coalesce(a.nd_hfee,0))) as hfee,
-                        sum(getpremi2(b.entity_id=1,coalesce(a.nd_taxcomm1,0))) as komisi_tax
-                        from (
-                            select a.status, a.pol_id, a.ccy_rate, a.entity_id, a.prod_id,
-                            getpremi(a.status = 'ENDORSE',a.insured_amount_e*a.ccy_rate,a.insured_amount*a.ccy_rate) as insured_amount,
-                            NULLIF(a.premi_total*ccy_rate,0) as premi_total,
-                            coalesce((select sum(x.amount*a.ccy_rate) from ins_pol_items x where x.ins_item_id in (25,18,32,11,112,116,117) and a.pol_id = x.pol_id),0) as nd_comm1,
-                            coalesce((select sum(x.tax_amount*a.ccy_rate) from ins_pol_items x where x.ins_item_id in (25,18,32,11,112,116,117) and x.tax_code in (1,2) and a.pol_id = x.pol_id),0) as nd_taxcomm1,
-                            coalesce((select sum(x.amount*a.ccy_rate) from ins_pol_items x where x.ins_item_id in (26,19,33,12,88,89,90,105,106,107,108) and a.pol_id = x.pol_id),0) as nd_brok1,
-                            coalesce((select sum(x.amount*a.ccy_rate) from ins_pol_items x where x.ins_item_id in (27,20,34,13) and a.pol_id = x.pol_id),0) as nd_hfee,
-                            coalesce((select sum(x.amount*a.ccy_rate) from ins_pol_items x where x.ins_item_id in (30,23,37,16) and a.pol_id = x.pol_id),0) as nd_disc1,
-                            coalesce((select sum(x.amount*a.ccy_rate) from ins_pol_items x where x.ins_item_id in (59,58,71,101,57,76,78,85,86,87,91,113,114,115) and a.pol_id = x.pol_id),0) as nd_ppn
-                            FROM ins_policy a      
-                            WHERE a.status IN ('POLICY','RENEWAL','ENDORSE') 
-                            AND a.active_flag = 'Y' AND a.effective_flag = 'Y' 
-                            AND date_trunc('day', a.approved_date)::date >= %s::date 
-                            AND date_trunc('day', a.approved_date)::date <= %s::date
-                        ) a 
-                        inner join ins_pol_coins b on b.policy_id = a.pol_id 
-                        where (b.entity_id <> 1 or b.coins_type <> 'COINS_COVER') 
-                        group by a.pol_id
-                    ) x
+                    WITH policy_base AS (
+                        -- 1. Ambil data Policy dasar terlebih dahulu (Filter Tanggal)
+                        --    Ini mengurangi beban agar database tidak scan seluruh tabel
+                        SELECT 
+                            p.pol_id, p.status, p.ccy_rate, p.entity_id, p.prod_id,
+                            p.insured_amount, p.insured_amount_e, p.premi_total,
+                            p.approved_date
+                        FROM ins_policy p
+                        WHERE p.status IN ('POLICY','RENEWAL','ENDORSE') 
+                        AND p.active_flag = 'Y' AND p.effective_flag = 'Y' 
+                        AND date_trunc('day', p.approved_date)::date >= %s::date 
+                        AND date_trunc('day', p.approved_date)::date <= %s::date
+                    ),
+                    item_sums AS (
+                        -- 2. Hitung total item SEKALIGUS (Pivot) agar tidak query berulang-ulang
+                        --    Menggantikan 7 subquery lambat di query asli
+                        SELECT
+                            i.pol_id,
+                            COALESCE(SUM(CASE WHEN i.ins_item_id IN (25,18,32,11,112,116,117) THEN i.amount ELSE 0 END), 0) as sum_comm,
+                            COALESCE(SUM(CASE WHEN i.ins_item_id IN (25,18,32,11,112,116,117) AND i.tax_code IN (1,2) THEN i.tax_amount ELSE 0 END), 0) as sum_taxcomm,
+                            COALESCE(SUM(CASE WHEN i.ins_item_id IN (26,19,33,12,88,89,90,105,106,107,108) THEN i.amount ELSE 0 END), 0) as sum_brok,
+                            COALESCE(SUM(CASE WHEN i.ins_item_id IN (27,20,34,13) THEN i.amount ELSE 0 END), 0) as sum_hfee,
+                            COALESCE(SUM(CASE WHEN i.ins_item_id IN (30,23,37,16) THEN i.amount ELSE 0 END), 0) as sum_disc,
+                            COALESCE(SUM(CASE WHEN i.ins_item_id IN (59,58,71,101,57,76,78,85,86,87,91,113,114,115) THEN i.amount ELSE 0 END), 0) as sum_ppn
+                        FROM ins_pol_items i
+                        INNER JOIN policy_base pb ON i.pol_id = pb.pol_id
+                        GROUP BY i.pol_id
+                    ),
+                    a_calculated AS (
+                        -- 3. Gabungkan Policy + Item Sums + Hitung CCY Rate 
+                        --    CTE ini setara dengan subquery tabel 'a' di query asli Anda
+                        SELECT 
+                            pb.pol_id,
+                            -- Logic getpremi asli: (status, insured_e*rate, insured*rate)
+                            getpremi(pb.status = 'ENDORSE', pb.insured_amount_e * pb.ccy_rate, pb.insured_amount * pb.ccy_rate) as insured_amount_val,
+                            NULLIF(pb.premi_total * pb.ccy_rate, 0) as premi_total_val,
+                            
+                            -- Kalkulasi nilai item * rate (Pengganti subquery select sum(...) * rate)
+                            (its.sum_comm * pb.ccy_rate) as nd_comm1,
+                            (its.sum_taxcomm * pb.ccy_rate) as nd_taxcomm1,
+                            (its.sum_brok * pb.ccy_rate) as nd_brok1,
+                            (its.sum_hfee * pb.ccy_rate) as nd_hfee,
+                            (its.sum_disc * pb.ccy_rate) as nd_disc1,
+                            (its.sum_ppn * pb.ccy_rate) as nd_ppn
+                        FROM policy_base pb
+                        LEFT JOIN item_sums its ON pb.pol_id = its.pol_id
+                    )
+                    -- 4. Final Aggregation (Meniru struktur terluar query asli)
+                    --    Menggunakan 'a' (dari a_calculated) dan 'b' (ins_pol_coins)
+                    SELECT 
+                        count(a.pol_id) as cnt, 
+                        sum(getpremi2(b.entity_id=1, coalesce(a.insured_amount_val,0))) as tsi, 
+                        sum(getpremi2(b.entity_id=1, coalesce(a.premi_total_val,0))) as premi, 
+                        sum(getpremi2(b.entity_id=1, coalesce(a.nd_disc1,0))) as diskon, 
+                        sum(getpremi2(b.entity_id=1, coalesce(a.nd_comm1,0))) as komisi, 
+                        sum(getpremi2(b.entity_id=1, coalesce(a.nd_ppn,0))) as ppn, 
+                        sum(getpremi2(b.entity_id=1, coalesce(a.nd_brok1,0))) as bfee, 
+                        sum(getpremi2(b.entity_id=1, coalesce(a.nd_hfee,0))) as hfee, 
+                        sum(getpremi2(b.entity_id=1, coalesce(a.nd_taxcomm1,0))) as tax_komisi
+                    FROM a_calculated a 
+                    INNER JOIN ins_pol_coins b ON b.policy_id = a.pol_id 
+                    WHERE (b.entity_id <> 1 OR b.coins_type <> 'COINS_COVER')
                 """
                 await cur.execute(q_prod, (start_date, end_date))
                 res_prod = await cur.fetchone()
 
         # --- 2. AMBIL DATA DARI WAREHOUSE (Gunakan get_async_wh_connection) ---
-        async with await get_async_wh_connection() as conn_wh:
+        async with pool_wh.connection() as conn_wh:
             async with conn_wh.cursor() as cur:
                 # Query WH Data Polis
                 q_wh_pol = """
@@ -1082,7 +1143,63 @@ def logout(request: Request):
     request.session.clear()
     return RedirectResponse(url="/", status_code=303)
 
+# ==========================================
+# 7. EXECUTION (FIXED: MANUAL LOOP + BYPASS UVICORN SETUP)
+# ==========================================
 if __name__ == "__main__":
-    # Karena kita menjalankan via 'python main.py', kode fix Windows di paling atas
-    # akan dieksekusi SEBELUM Uvicorn menyalakan event loop-nya.
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # Deteksi Mode (.EXE atau VS Code)
+    is_frozen = getattr(sys, 'frozen', False)
+
+    if not is_frozen:
+        # --- MODE DEVELOPMENT ---
+        # Di VS Code, kita biarkan Uvicorn mengatur segalanya agar fitur reload jalan
+        print("🔧 Mode: DEVELOPMENT (Auto-Reload)")
+        uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+    else:
+        # --- MODE PRODUCTION (.EXE) ---
+        print("🚀 Mode: PRODUCTION (.EXE)")
+        print("   Mengaktifkan WindowsSelectorEventLoop...")
+
+        # 1. Paksa Policy ke Selector (Wajib untuk Psycopg)
+        if sys.platform == 'win32':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+        # 2. Buat Loop Manual
+        # Kita buat loop sendiri agar 100% yakin ini adalah SelectorLoop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        # 3. Konfigurasi Server
+        config = uvicorn.Config(
+            app=app, 
+            host="0.0.0.0", 
+            port=8000, 
+            log_level="info",
+            reload=False,
+            # [FIX UTAMA] loop="none"
+            # Ini mencegah Uvicorn mereset loop yang sudah kita buat susah payah di atas.
+            loop="none" 
+        )
+        server = uvicorn.Server(config)
+
+        # 4. Jalankan Server di dalam Loop Manual kita
+        try:
+            print("✅ Server Berjalan di http://localhost:8000")
+            print("   (JANGAN tutup jendela ini agar aplikasi tetap jalan)")
+            
+            # Kita jalankan server secara manual di loop yang sudah kita siapkan
+            loop.run_until_complete(server.serve())
+            
+        except KeyboardInterrupt:
+            print("\n🛑 Aplikasi dihentikan pengguna.")
+            
+        except Exception as e:
+            # Tangkap Crash agar window tidak langsung hilang
+            import traceback
+            print("\n❌ CRASH ERROR (JANGAN PANIK, FOTO ERROR INI):")
+            traceback.print_exc()
+            input("\nTekan [ENTER] untuk menutup jendela...")
+            
+        finally:
+            loop.close()
