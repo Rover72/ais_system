@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+psycopg[binary]
+psycopg-pool
+python-dotenv
+jinja2
+pandas
+passlib
+argon2-cffi
